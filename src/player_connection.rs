@@ -1,64 +1,62 @@
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
-use actix::{Actor, ActorContext, Addr, AsyncContext, Context, ContextFutureSpawner, Handler, Message, Recipient, SpawnHandle, WrapFuture};
-use actix_rt::net::UdpSocket;
-use bytes::Bytes;
+use actix::{Actor, Addr, AsyncContext, Context, Handler, Message, Recipient, WrapFuture};
 use crate::connection_manager::Prune;
-use crate::packet_header::PacketHeader;
+use crate::net::{Packet, ConnectionWriter, PacketManager};
 
 pub struct PlayerConnection {
-    addr: SocketAddr,
     recipient: Recipient<Prune>,
-    socket: Arc<UdpSocket>,
-    stop_task: SpawnHandle
+    conn_writer: ConnectionWriter,
+    packet_manager: PacketManager
 }
 
 #[derive(Message)]
 #[rtype(result = "()")]
-pub struct Packet(pub PacketHeader);
+pub struct IncomingRequest(pub Packet);
 
 impl PlayerConnection {
-    pub fn new(addr: SocketAddr, recipient: Recipient<Prune>, socket: Arc<UdpSocket>) -> Addr<Self> {
+    pub fn new(conn_writer: ConnectionWriter, recipient: Recipient<Prune>) -> Addr<Self> {
         Self::create(|ctx| {
-            Self {
-                addr,
+            let result = Self {
                 recipient,
-                socket,
-                stop_task: Self::spawn_stop_task(ctx)
-            }
-        })
-    }
-    
-    fn spawn_stop_task(ctx: &mut Context<Self>) -> SpawnHandle {
-        ctx.run_later(Duration::from_secs(10), |this, ctx| {
-            ctx.stop();
-            this.recipient.do_send(Prune(this.addr));
+                conn_writer,
+                packet_manager: PacketManager::new()
+            };
+            result
         })
     }
 }
 
 impl Actor for PlayerConnection {
     type Context = Context<Self>;
+
+    // fn started(&mut self, ctx: &mut Self::Context) {
+    //     let frequency = Duration::from_secs(10);
+    //     let this = ctx.address();
+    //     let future = async move {
+    //         let mut interval = interval_at(Instant::now() + frequency, frequency);
+    //         loop {
+    //             interval.tick().await;
+    //             let _ = this.send(Stop).await;
+    //         }
+    // 
+    //     };
+    //     future.into_actor(self).spawn(ctx);
+    // }
 }
 
-impl Handler<Packet> for PlayerConnection {
+impl Handler<IncomingRequest> for PlayerConnection {
     type Result = ();
 
-    fn handle(&mut self, Packet(mut header): Packet, ctx: &mut Self::Context) -> Self::Result {
-        // cancel the stop task since a request came in
-        ctx.cancel_future(self.stop_task);
-        println!("{}: {:?}", self.addr, header);
-        let socket = self.socket.clone();
-        let to_addr = self.addr.clone();
-        let future = async move {
-            header.sequence += 1;
-            header.ack += 1;
-            let data: Bytes = header.into();
-            let _ = socket.send_to(&data, to_addr).await;
+    fn handle(&mut self, IncomingRequest(Packet(header)): IncomingRequest, ctx: &mut Self::Context) -> Self::Result {
+        println!("{}: {:?}", self.conn_writer.to_address(), header);
+        if let Some(dropped_packets) = self.packet_manager.receive(&header) {
+            println!("Uh oh, we dropped some packets: {:?}", dropped_packets);
+        }
+        let packet = Packet(self.packet_manager.send().unwrap());
+        let future = self.conn_writer.send(packet);
+        let future = async move { 
+            let _ = future.await;
         };
-        future.into_actor(self).spawn(ctx);
-        // then, restart the stop task so we time out if no requests come in again
-        self.stop_task = Self::spawn_stop_task(ctx);
+        let future = future.into_actor(self);
+        ctx.spawn(future);
     }
 }

@@ -1,7 +1,7 @@
 mod player_connection;
 mod connection_manager;
 mod server;
-mod packet_header;
+mod net;
 
 use actix_rt::net::UdpSocket;
 use crate::server::Server;

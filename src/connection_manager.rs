@@ -1,12 +1,8 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::os::unix::raw::mode_t;
-use std::sync::Arc;
 use actix::{Actor, Addr, AsyncContext, Context, ContextFutureSpawner, Handler, Message, WrapFuture};
-use actix_rt::net::UdpSocket;
-use bytes::Bytes;
-use crate::packet_header::ToPacketHeaderError;
-use crate::player_connection::{Packet, PlayerConnection};
+use crate::net::{Packet, ConnectionWriter};
+use crate::player_connection::{IncomingRequest, PlayerConnection};
 
 pub struct ConnectionManager {
     connections: HashMap<SocketAddr, Addr<PlayerConnection>>
@@ -23,24 +19,20 @@ impl Actor for ConnectionManager {
 }
 
 #[derive(Message)]
-#[rtype(result = "Result<(), ToPacketHeaderError>")]
-pub struct NewConnection(pub SocketAddr, pub Bytes, pub Arc<UdpSocket>);
+#[rtype(result = "()")]
+pub struct NewConnection(pub Packet, pub ConnectionWriter);
 
 impl Handler<NewConnection> for ConnectionManager {
-    type Result = Result<(), ToPacketHeaderError>;
+    type Result = ();
 
-    fn handle(&mut self, NewConnection(addr, bytes, socket): NewConnection, ctx: &mut Self::Context) -> Self::Result {
-        let connection = self.connections.entry(addr)
-            .or_insert_with(|| PlayerConnection::new(addr, ctx.address().recipient(), socket));
-        
-        let packet = Packet(bytes.try_into()?);
-        let connection = connection.clone();
+    fn handle(&mut self, NewConnection(packet, conn_writer): NewConnection, ctx: &mut Self::Context) -> Self::Result {
+        let connection = self.connections.entry(conn_writer.to_address())
+            .or_insert_with(|| PlayerConnection::new(conn_writer, ctx.address().recipient()));
+        let future = connection.send(IncomingRequest(packet));
         let future = async move { 
-            let _ = connection.send(packet).await;
+            let _ = future.await;
         };
         future.into_actor(self).spawn(ctx);
-        
-        Ok(())
     }
 }
 
